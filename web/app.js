@@ -3351,6 +3351,10 @@ class RealTimeAnalyticsTracker {
     this.currentSection = config.currentSection;
     this.isActive = true;
     
+    // Section detection cache
+    this.sectionCache = new Map();
+    this.lastSectionUpdate = 0;
+    
     // Initialize page and section data
     this.initializeData();
     
@@ -3374,30 +3378,44 @@ class RealTimeAnalyticsTracker {
       };
     }
     
-    // Initialize section data
+    // Initialize section data with better structure
     this.config.outlineStructure.forEach(section => {
       this.sectionData[section.id] = {
         id: section.id,
         title: section.title,
         page: section.page,
+        endPage: section.endPage || section.page,
         timeSpent: 0,
         visits: 0,
         completed: false,
         wordsRead: 0,
         startTime: null,
-        endTime: null
+        endTime: null,
+        pagesInSection: []
       };
+      
+      // Calculate pages in section
+      for (let p = section.page; p <= (section.endPage || section.page); p++) {
+        this.sectionData[section.id].pagesInSection.push(p);
+      }
     });
   }
 
   startActivityMonitoring() {
-    // Track user activity
+    // Track user activity with throttling
     const activityEvents = ['click', 'scroll', 'keypress', 'mousemove'];
-    activityEvents.forEach(event => {
-      document.addEventListener(event, () => {
+    let activityThrottle;
+    
+    const handleActivity = () => {
+      clearTimeout(activityThrottle);
+      activityThrottle = setTimeout(() => {
         this.lastActivityTime = Date.now();
         this.isActive = true;
-      }, { passive: true });
+      }, 100);
+    };
+    
+    activityEvents.forEach(event => {
+      document.addEventListener(event, handleActivity, { passive: true });
     });
     
     // Check for inactivity every 5 seconds
@@ -3413,31 +3431,38 @@ class RealTimeAnalyticsTracker {
     const now = Date.now();
     
     // Record time spent on previous page
-    if (fromPage && this.pageStartTime) {
+    if (fromPage && this.pageStartTime && this.isActive) {
       const timeSpent = now - this.pageStartTime;
-      this.pageData[fromPage].timeSpent += timeSpent;
-      this.pageData[fromPage].completed = this.pageData[fromPage].timeSpent >= 3000; // 3 seconds minimum
+      if (timeSpent > 0 && timeSpent < 300000) { // Cap at 5 minutes per page
+        this.pageData[fromPage].timeSpent += timeSpent;
+        this.pageData[fromPage].completed = this.pageData[fromPage].timeSpent >= 3000;
+      }
     }
     
     // Update page visits
-    this.pageData[toPage].visits += 1;
-    this.pageData[toPage].lastVisited = now;
+    if (this.pageData[toPage]) {
+      this.pageData[toPage].visits += 1;
+      this.pageData[toPage].lastVisited = now;
+    }
     
     // Record page change event
+    const changeType = this.getPageChangeType(fromPage, toPage);
     this.pageChanges.push({
       fromPage,
       toPage,
       timestamp: now,
-      type: this.getPageChangeType(fromPage, toPage)
+      type: changeType
     });
     
     // Update page start time
     this.pageStartTime = now;
     this.currentPage = toPage;
+    
+    console.log(`Page change recorded: ${fromPage} -> ${toPage} (${changeType})`);
   }
 
   getPageChangeType(fromPage, toPage) {
-    if (!fromPage || !toPage) return 'unknown';
+    if (!fromPage || !toPage) return 'initial';
     const diff = toPage - fromPage;
     if (diff === 1) return 'forward';
     if (diff === -1) return 'backward';
@@ -3448,26 +3473,41 @@ class RealTimeAnalyticsTracker {
   recordSectionChange(fromSection, toSection) {
     const now = Date.now();
     
+    // Prevent too frequent section changes
+    if (now - this.lastSectionUpdate < 1000) return;
+    this.lastSectionUpdate = now;
+    
     // End previous section
-    if (fromSection && this.sectionStartTime) {
+    if (fromSection && this.sectionStartTime && this.isActive) {
       const timeSpent = now - this.sectionStartTime;
-      this.sectionData[fromSection.id].timeSpent += timeSpent;
-      this.sectionData[fromSection.id].endTime = now;
-      
-      // Check if section is completed (spent at least 5 seconds)
-      this.sectionData[fromSection.id].completed = this.sectionData[fromSection.id].timeSpent >= 5000;
+      if (timeSpent > 0 && timeSpent < 300000) { // Cap at 5 minutes
+        this.sectionData[fromSection.id].timeSpent += timeSpent;
+        this.sectionData[fromSection.id].endTime = now;
+        
+        // Check if section is completed
+        const sectionPages = this.sectionData[fromSection.id].pagesInSection;
+        const pagesRead = sectionPages.filter(p => this.pageData[p] && this.pageData[p].completed).length;
+        this.sectionData[fromSection.id].completed = pagesRead >= sectionPages.length * 0.8;
+        
+        console.log(`Section ${fromSection.title} time updated: ${timeSpent}ms (total: ${this.sectionData[fromSection.id].timeSpent}ms)`);
+      }
     }
     
     // Start new section
-    if (toSection) {
+    if (toSection && this.sectionData[toSection.id]) {
       this.sectionData[toSection.id].visits += 1;
       this.sectionData[toSection.id].startTime = now;
       this.sectionStartTime = now;
       this.currentSection = toSection;
+      
+      console.log(`Started tracking section: ${toSection.title}`);
     }
   }
 
   recordTextSelection(selectionData) {
+    // Validate selection data
+    if (!selectionData || !selectionData.text || selectionData.text.length < 3) return;
+    
     this.textSelections.push({
       ...selectionData,
       id: `selection_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
@@ -3477,14 +3517,30 @@ class RealTimeAnalyticsTracker {
     if (this.textSelections.length > 100) {
       this.textSelections = this.textSelections.slice(-100);
     }
+    
+    console.log(`Text selection recorded: ${selectionData.text.substring(0, 50)}...`);
   }
 
   getAnalytics() {
     const now = Date.now();
     const sessionTime = now - this.sessionStartTime;
     
-    // Calculate active time (sum of all page times)
-    const activeTime = Object.values(this.pageData).reduce((sum, page) => sum + page.timeSpent, 0);
+    // Update current page time if active
+    if (this.pageStartTime && this.currentPage && this.pageData[this.currentPage] && this.isActive) {
+      const currentPageTime = Math.min(now - this.pageStartTime, 300000);
+      this.pageData[this.currentPage].timeSpent += currentPageTime;
+      this.pageStartTime = now;
+    }
+    
+    // Update current section time if active
+    if (this.sectionStartTime && this.currentSection && this.sectionData[this.currentSection.id] && this.isActive) {
+      const currentSectionTime = Math.min(now - this.sectionStartTime, 300000);
+      this.sectionData[this.currentSection.id].timeSpent += currentSectionTime;
+      this.sectionStartTime = now;
+    }
+    
+    // Calculate active time
+    const activeTime = Object.values(this.pageData).reduce((sum, page) => sum + (page.timeSpent || 0), 0);
     
     // Calculate pages read
     const pagesRead = Object.values(this.pageData).filter(page => page.completed).length;
@@ -3498,12 +3554,22 @@ class RealTimeAnalyticsTracker {
     const jumpMoves = this.pageChanges.filter(change => change.type === 'jump').length;
     const totalMoves = forwardMoves + backwardMoves + jumpMoves;
     
-    // Calculate reading speed (rough estimate)
-    const wordsRead = Object.values(this.pageData).reduce((sum, page) => sum + page.wordsRead, 0);
-    const readingSpeed = activeTime > 0 ? Math.round((wordsRead / (activeTime / 60000))) : 0;
+    // Calculate words read
+    const wordsFromSelections = this.textSelections.reduce((sum, selection) => {
+      const words = selection.text.split(/\s+/).filter(word => word.length > 0);
+      return sum + words.length;
+    }, 0);
+    
+    const estimatedWordsPerPage = this.config.averageWordsPerPage || 275;
+    const estimatedWordsRead = pagesRead * estimatedWordsPerPage;
+    const totalWordsRead = Math.max(wordsFromSelections, estimatedWordsRead);
+    
+    // Calculate reading speed
+    const activeTimeMinutes = activeTime / 60000;
+    const readingSpeed = activeTimeMinutes > 0 ? Math.round(totalWordsRead / activeTimeMinutes) : 0;
     
     // Current section time
-    const currentSectionTime = this.currentSection && this.sectionStartTime ? 
+    const currentSectionTime = this.currentSection && this.sectionStartTime && this.isActive ? 
       now - this.sectionStartTime : 0;
     
     return {
@@ -3516,14 +3582,17 @@ class RealTimeAnalyticsTracker {
       forwardMoves,
       backwardMoves,
       jumpMoves,
-      linearReadingPercentage: totalMoves > 0 ? (forwardMoves / totalMoves) * 100 : 0,
-      progressPercentage: (pagesRead / this.config.totalPages) * 100,
-      wordsRead,
-      readingSpeed: Math.max(0, Math.min(readingSpeed, 1000)), // Cap at reasonable WPM
+      linearReadingPercentage: totalMoves > 0 ? Math.round((forwardMoves / totalMoves) * 100) : 0,
+      progressPercentage: this.config.totalPages > 0 ? (pagesRead / this.config.totalPages) * 100 : 0,
+      wordsRead: totalWordsRead,
+      readingSpeed: Math.max(0, Math.min(readingSpeed, 1000)),
       currentSectionTime,
       sections: this.sectionData,
       pages: this.pageData,
-      isActive: this.isActive
+      isActive: this.isActive,
+      totalPages: this.config.totalPages,
+      currentPage: this.currentPage,
+      currentSection: this.currentSection
     };
   }
 
@@ -3531,21 +3600,24 @@ class RealTimeAnalyticsTracker {
     this.sessionStartTime = Date.now();
     this.pageStartTime = Date.now();
     this.sectionStartTime = Date.now();
+    this.lastSectionUpdate = 0;
     this.textSelections = [];
     this.pageChanges = [];
     this.readingEvents = [];
+    this.sectionCache.clear();
     this.initializeData();
   }
 
   destroy() {
-    // Cleanup any intervals or event listeners
+    this.sectionCache.clear();
     console.log('RealTimeAnalyticsTracker destroyed');
   }
-}/**
+}
+
+/**
  * PDF Analytics Core Initializer
  * This function integrates with PDF.js to provide comprehensive analytics tracking
  */
-
 class PDFAnalyticsCore {
   constructor() {
     this.isInitialized = false;
@@ -3566,15 +3638,15 @@ class PDFAnalyticsCore {
     
     // Event listeners storage for cleanup
     this.eventListeners = [];
+    
+    // Section detection improvements
+    this.sectionDetectionCache = new Map();
+    this.pageToSectionMap = new Map();
+    this.sectionHeadingPatterns = [];
+    this.lastDetectedSection = null;
+    this.sectionDetectionConfidence = 0;
   }
 
-  /**
-   * Main initialization function - call this to set up PDF analytics
-   * @param {Object} options - Configuration options
-   * @param {string} options.documentId - Unique identifier for the document
-   * @param {Function} options.onAnalyticsUpdate - Callback for analytics updates
-   * @param {boolean} options.enableTextExtraction - Whether to extract text content
-   */
   async initializePDFAnalytics(options = {}) {
     try {
       console.log('Initializing PDF Analytics...');
@@ -3584,7 +3656,8 @@ class PDFAnalyticsCore {
         onAnalyticsUpdate: options.onAnalyticsUpdate || (() => {}),
         enableTextExtraction: options.enableTextExtraction !== false,
         autoSave: options.autoSave !== false,
-        trackingSensitivity: options.trackingSensitivity || 'normal' // 'low', 'normal', 'high'
+        trackingSensitivity: options.trackingSensitivity || 'normal',
+        sectionDetectionMode: options.sectionDetectionMode || 'hybrid' // 'outline', 'text', 'hybrid'
       };
 
       // Wait for PDF.js to be available
@@ -3598,6 +3671,9 @@ class PDFAnalyticsCore {
       
       // Extract document structure
       await this.extractDocumentStructure();
+      
+      // Build section detection helpers
+      this.buildSectionDetectionHelpers();
       
       // Setup event listeners
       this.setupEventListeners();
@@ -3629,9 +3705,6 @@ class PDFAnalyticsCore {
     }
   }
 
-  /**
-   * Wait for PDF.js to be available in the global scope
-   */
   async waitForPDFJS() {
     return new Promise((resolve, reject) => {
       const maxAttempts = 100;
@@ -3653,9 +3726,6 @@ class PDFAnalyticsCore {
     });
   }
 
-  /**
-   * Get references to PDF.js components
-   */
   setupPDFJSReferences() {
     const app = window.PDFViewerApplication;
     
@@ -3674,9 +3744,6 @@ class PDFAnalyticsCore {
     console.log('PDF.js references established');
   }
 
-  /**
-   * Wait for PDF document to be fully loaded
-   */
   async waitForDocumentLoad() {
     return new Promise((resolve, reject) => {
       if (this.pdfDocument && this.pdfDocument.numPages > 0) {
@@ -3708,9 +3775,6 @@ class PDFAnalyticsCore {
     });
   }
 
-  /**
-   * Extract document outline structure for section tracking
-   */
   async extractDocumentStructure() {
     try {
       console.log('Extracting document structure...');
@@ -3719,13 +3783,16 @@ class PDFAnalyticsCore {
       const outline = await this.pdfDocument.getOutline();
       
       if (outline && outline.length > 0) {
-        this.outlineStructure = this.parseOutline(outline);
+        this.outlineStructure = await this.parseOutlineWithAccuracy(outline);
         console.log(`Found ${this.outlineStructure.length} outline items`);
       } else {
         // Create default sections based on page ranges
         this.outlineStructure = this.createDefaultSections();
         console.log('No outline found, created default sections');
       }
+      
+      // Calculate end pages for sections
+      this.calculateSectionEndPages();
       
       // Extract text content if enabled
       if (this.options.enableTextExtraction) {
@@ -3738,31 +3805,26 @@ class PDFAnalyticsCore {
     }
   }
 
-  /**
-   * Parse PDF outline into our structure format
-   */
-  parseOutline(outline, level = 1, startPage = 1) {
+  async parseOutlineWithAccuracy(outline, level = 1) {
     const sections = [];
     
     for (let i = 0; i < outline.length; i++) {
       const item = outline[i];
       
       try {
-        // Get page number from destination
-        let pageNumber = startPage;
+        // Get accurate page number from destination
+        let pageNumber = 1;
+        
         if (item.dest) {
-          if (Array.isArray(item.dest) && item.dest[0]) {
-            // Handle page reference
-            const pageRef = item.dest[0];
-            if (typeof pageRef === 'object' && pageRef.num) {
-              // This is a page reference object
-              pageNumber = this.getPageNumberFromRef(pageRef);
-            } else if (typeof pageRef === 'number') {
-              pageNumber = pageRef + 1; // PDF pages are 0-indexed
+          if (typeof item.dest === 'string') {
+            // Named destination
+            const dest = await this.pdfDocument.getDestination(item.dest);
+            if (dest) {
+              pageNumber = await this.getPageNumberFromDest(dest);
             }
-          } else if (typeof item.dest === 'string') {
-            // Handle named destination
-            pageNumber = this.getPageNumberFromNamedDest(item.dest);
+          } else if (Array.isArray(item.dest)) {
+            // Direct destination
+            pageNumber = await this.getPageNumberFromDest(item.dest);
           }
         }
         
@@ -3770,26 +3832,27 @@ class PDFAnalyticsCore {
           title: item.title || `Section ${sections.length + 1}`,
           page: Math.max(1, Math.min(pageNumber, this.totalPages)),
           level: level,
-          id: `section_${level}_${i}`,
-          children: []
+          id: `section_${level}_${i}_${Date.now()}`,
+          children: [],
+          endPage: null // Will be calculated later
         };
         
         // Parse children recursively
         if (item.items && item.items.length > 0) {
-          section.children = this.parseOutline(item.items, level + 1, section.page);
+          section.children = await this.parseOutlineWithAccuracy(item.items, level + 1);
         }
         
         sections.push(section);
         
       } catch (error) {
         console.warn('Error parsing outline item:', error);
-        // Add a fallback section
         sections.push({
           title: item.title || `Section ${sections.length + 1}`,
-          page: startPage,
+          page: 1,
           level: level,
-          id: `section_${level}_${i}`,
-          children: []
+          id: `section_${level}_${i}_${Date.now()}`,
+          children: [],
+          endPage: null
         });
       }
     }
@@ -3797,40 +3860,76 @@ class PDFAnalyticsCore {
     return sections;
   }
 
-  /**
-   * Get page number from page reference object
-   */
-  getPageNumberFromRef(pageRef) {
+  async getPageNumberFromDest(dest) {
     try {
-      // This requires access to the PDF document's page references
-      // For now, use a simple heuristic
-      return Math.max(1, pageRef.num || 1);
+      if (!dest || !Array.isArray(dest) || dest.length === 0) return 1;
+      
+      const ref = dest[0];
+      if (!ref) return 1;
+      
+      // Get page index from reference
+      const pageIndex = await this.pdfDocument.getPageIndex(ref);
+      return pageIndex + 1; // Convert 0-based to 1-based
+      
     } catch (error) {
-      console.warn('Error getting page number from reference:', error);
+      console.warn('Error resolving page number:', error);
       return 1;
     }
   }
 
-  /**
-   * Get page number from named destination
-   */
-  getPageNumberFromNamedDest(destName) {
-    try {
-      // This would require resolving named destinations
-      // For now, return page 1 as fallback
-      return 1;
-    } catch (error) {
-      console.warn('Error getting page number from named destination:', error);
-      return 1;
+  calculateSectionEndPages() {
+    // Flatten outline structure for easier processing
+    const flatSections = this.flattenOutline(this.outlineStructure);
+    
+    // Sort by page number
+    flatSections.sort((a, b) => a.page - b.page);
+    
+    // Calculate end pages
+    for (let i = 0; i < flatSections.length; i++) {
+      if (i < flatSections.length - 1) {
+        flatSections[i].endPage = flatSections[i + 1].page - 1;
+      } else {
+        flatSections[i].endPage = this.totalPages;
+      }
+      
+      // Ensure endPage is at least the start page
+      flatSections[i].endPage = Math.max(flatSections[i].endPage, flatSections[i].page);
+    }
+    
+    // Update the original structure
+    this.updateOutlineEndPages(this.outlineStructure, flatSections);
+  }
+
+  flattenOutline(outline, result = []) {
+    for (const section of outline) {
+      result.push({
+        ...section,
+        children: undefined
+      });
+      
+      if (section.children && section.children.length > 0) {
+        this.flattenOutline(section.children, result);
+      }
+    }
+    return result;
+  }
+
+  updateOutlineEndPages(outline, flatSections) {
+    for (const section of outline) {
+      const flat = flatSections.find(f => f.id === section.id);
+      if (flat) {
+        section.endPage = flat.endPage;
+      }
+      
+      if (section.children && section.children.length > 0) {
+        this.updateOutlineEndPages(section.children, flatSections);
+      }
     }
   }
 
-  /**
-   * Create default sections when no outline is available
-   */
   createDefaultSections() {
     const sections = [];
-    const pagesPerSection = Math.max(1, Math.ceil(this.totalPages / 10)); // Max 10 sections
+    const pagesPerSection = Math.max(1, Math.ceil(this.totalPages / 10));
     
     for (let i = 0; i < this.totalPages; i += pagesPerSection) {
       const startPage = i + 1;
@@ -3839,38 +3938,68 @@ class PDFAnalyticsCore {
       sections.push({
         title: `Section ${Math.ceil(startPage / pagesPerSection)}`,
         page: startPage,
+        endPage: endPage,
         level: 1,
         id: `default_section_${sections.length}`,
-        children: [],
-        endPage: endPage
+        children: []
       });
     }
     
     return sections;
   }
 
-  /**
-   * Extract text content from pages for word counting
-   */
+  buildSectionDetectionHelpers() {
+    // Build page to section mapping
+    const flatSections = this.flattenOutline(this.outlineStructure);
+    
+    for (const section of flatSections) {
+      for (let page = section.page; page <= (section.endPage || section.page); page++) {
+        if (!this.pageToSectionMap.has(page)) {
+          this.pageToSectionMap.set(page, []);
+        }
+        this.pageToSectionMap.get(page).push(section);
+      }
+    }
+    
+    // Build section heading patterns from titles
+    this.sectionHeadingPatterns = flatSections.map(section => ({
+      section: section,
+      pattern: this.createHeadingPattern(section.title),
+      words: section.title.toLowerCase().split(/\s+/).filter(w => w.length > 2)
+    }));
+    
+    console.log(`Built section detection helpers: ${this.pageToSectionMap.size} page mappings`);
+  }
+
+  createHeadingPattern(title) {
+    // Escape special regex characters
+    const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    
+    // Create flexible pattern
+    return new RegExp(
+      escaped.split(/\s+/).join('\\s*'),
+      'i'
+    );
+  }
+
   async extractTextContent() {
     console.log('Extracting text content...');
     
     try {
-      // Extract text from first few pages for better reading speed calculation
-      const pagesToExtract = Math.min(5, this.totalPages);
+      // Extract text from more pages for better section detection
+      const pagesToExtract = Math.min(10, this.totalPages);
       
       for (let pageNum = 1; pageNum <= pagesToExtract; pageNum++) {
         try {
           const page = await this.pdfDocument.getPage(pageNum);
           const textContent = await page.getTextContent();
           
-          // Combine text items
-          const text = textContent.items
-            .map(item => item.str)
-            .join(' ')
-            .trim();
-          
-          this.pageTextContent[pageNum] = text;
+          // Store structured text content
+          this.pageTextContent[pageNum] = {
+            raw: textContent.items.map(item => item.str).join(' ').trim(),
+            items: textContent.items,
+            structured: this.structureTextContent(textContent.items)
+          };
           
         } catch (error) {
           console.warn(`Error extracting text from page ${pageNum}:`, error);
@@ -3884,9 +4013,75 @@ class PDFAnalyticsCore {
     }
   }
 
-  /**
-   * Setup event listeners for PDF.js events
-   */
+  structureTextContent(items) {
+    const structured = {
+      headings: [],
+      paragraphs: [],
+      allText: []
+    };
+    
+    let currentY = null;
+    let currentLine = [];
+    
+    for (const item of items) {
+      if (!item.str || item.str.trim().length === 0) continue;
+      
+      // Group items by Y position (same line)
+      if (currentY === null || Math.abs(item.transform[5] - currentY) < 2) {
+        currentLine.push(item);
+        currentY = item.transform[5];
+      } else {
+        // Process completed line
+        if (currentLine.length > 0) {
+          const lineText = currentLine.map(i => i.str).join(' ').trim();
+          const lineHeight = Math.max(...currentLine.map(i => i.height || 0));
+          
+          structured.allText.push({
+            text: lineText,
+            height: lineHeight,
+            y: currentY,
+            items: currentLine
+          });
+          
+          // Detect headings based on font size
+          if (lineHeight > 12 && lineText.length < 100) {
+            structured.headings.push({
+              text: lineText,
+              height: lineHeight,
+              y: currentY
+            });
+          }
+        }
+        
+        currentLine = [item];
+        currentY = item.transform[5];
+      }
+    }
+    
+    // Process last line
+    if (currentLine.length > 0) {
+      const lineText = currentLine.map(i => i.str).join(' ').trim();
+      const lineHeight = Math.max(...currentLine.map(i => i.height || 0));
+      
+      structured.allText.push({
+        text: lineText,
+        height: lineHeight,
+        y: currentY,
+        items: currentLine
+      });
+      
+      if (lineHeight > 12 && lineText.length < 100) {
+        structured.headings.push({
+          text: lineText,
+          height: lineHeight,
+          y: currentY
+        });
+      }
+    }
+    
+    return structured;
+  }
+
   setupEventListeners() {
     console.log('Setting up event listeners...');
     
@@ -3895,153 +4090,371 @@ class PDFAnalyticsCore {
       this.handlePageChange(evt.pageNumber);
     });
     
-    // Update current section based on page
-    this.addEventListener('pagechanging', (evt) => {
-      this.updateCurrentSection(evt.pageNumber);
-    });
-    
     // Document events
     this.addEventListener('documentloaded', () => {
       console.log('Document fully loaded');
     });
     
-    // Scale/zoom events
-    this.addEventListener('scalechanging', (evt) => {
-      console.log('Scale changed:', evt.scale);
-    });
-    
-    // Rotation events
-    this.addEventListener('rotationchanging', (evt) => {
-      console.log('Rotation changed:', evt.pagesRotation);
-    });
-    
-    // Text selection (if available)
+    // Text selection tracking
     this.setupTextSelectionTracking();
+    
+    // Viewport tracking for better section detection
+    this.setupViewportTracking();
     
     console.log('Event listeners configured');
   }
 
-  /**
-   * Add event listener with cleanup tracking
-   */
-  addEventListener(eventName, handler) {
-    if (this.eventBus) {
-      this.eventBus._on(eventName, handler);
-      this.eventListeners.push({ eventName, handler });
-    }
-  }
-
-  /**
-   * Setup text selection tracking
-   */
   setupTextSelectionTracking() {
+    let selectionTimeout;
+    
     const handleTextSelection = () => {
-      const selection = window.getSelection();
-      if (selection && selection.toString().length > 10) {
-        // Add activity
-        this.addActivity(`Selected text: "${selection.toString().substring(0, 30)}..."`);
-        
-        // Notify analytics tracker about text selection
-        if (this.analyticsTracker) {
-          this.analyticsTracker.recordTextSelection({
-            text: selection.toString(),
-            page: this.currentPage,
-            section: this.currentSection ? this.currentSection.title : 'Unknown',
-            timestamp: Date.now(),
-            length: selection.toString().length
-          });
+      clearTimeout(selectionTimeout);
+      
+      selectionTimeout = setTimeout(() => {
+        const selection = window.getSelection();
+        if (selection && selection.toString().length > 5) {
+          const selectedText = selection.toString().trim();
+          
+          // Get the page number from the selection
+          const range = selection.getRangeAt(0);
+          const container = range.commonAncestorContainer;
+          const pageElement = this.findPageElement(container);
+          const pageNumber = pageElement ? this.getPageNumberFromElement(pageElement) : this.currentPage;
+          
+          // Detect section more accurately
+          const detectedSection = this.detectSectionFromContent(selectedText, pageNumber);
+          
+          if (detectedSection && detectedSection.confidence > 0.5) {
+            this.updateCurrentSection(detectedSection.section, 'text_selection');
+          }
+          
+          // Record selection
+          if (this.analyticsTracker) {
+            this.analyticsTracker.recordTextSelection({
+              text: selectedText,
+              page: pageNumber,
+              section: this.currentSection ? this.currentSection.title : 'Unknown',
+              timestamp: Date.now(),
+              length: selectedText.length
+            });
+          }
+          
+          // Add activity
+          const preview = selectedText.length > 50 ? 
+            selectedText.substring(0, 50) + '...' : selectedText;
+          this.addActivity(`Selected text: "${preview}"`);
         }
-      }
+      }, 300);
     };
     
     document.addEventListener('mouseup', handleTextSelection);
+    document.addEventListener('selectionchange', handleTextSelection);
+    
+    this.eventListeners.push(
+      { element: document, eventName: 'mouseup', handler: handleTextSelection },
+      { element: document, eventName: 'selectionchange', handler: handleTextSelection }
+    );
+  }
+
+  setupViewportTracking() {
+    let viewportTimeout;
+    
+    const handleViewportChange = () => {
+      clearTimeout(viewportTimeout);
+      
+      viewportTimeout = setTimeout(() => {
+        this.detectSectionFromViewport();
+      }, 500);
+    };
+    
+    // Find PDF viewer container
+    const viewerContainer = document.querySelector('#viewerContainer') || 
+                           document.querySelector('.pdfViewer');
+    
+    if (viewerContainer) {
+      viewerContainer.addEventListener('scroll', handleViewportChange, { passive: true });
+      this.eventListeners.push({
+        element: viewerContainer,
+        eventName: 'scroll',
+        handler: handleViewportChange
+      });
+    }
+    
+    // Also track resize events
+    window.addEventListener('resize', handleViewportChange);
     this.eventListeners.push({
-      element: document,
-      eventName: 'mouseup',
-      handler: handleTextSelection
+      element: window,
+      eventName: 'resize',
+      handler: handleViewportChange
     });
   }
 
-  /**
-   * Handle page changes
-   */
-  handlePageChange(newPage) {
-    if (newPage !== this.currentPage) {
-      console.log(`Page changed: ${this.currentPage} -> ${newPage}`);
-      
-      // Add activity
-      this.addActivity(`Moved to page ${newPage}`);
-      
-      this.currentPage = newPage;
-      
-      // Update analytics
-      if (this.analyticsTracker) {
-        this.analyticsTracker.currentPage = newPage;
-        this.analyticsTracker.recordPageChange(this.currentPage, newPage);
+  findPageElement(node) {
+    let current = node;
+    while (current && current !== document.body) {
+      if (current.nodeType === Node.ELEMENT_NODE) {
+        if (current.classList && current.classList.contains('page')) {
+          return current;
+        }
+        if (current.getAttribute && current.getAttribute('data-page-number')) {
+          return current;
+        }
       }
-      
-      // Extract text content for new page if not already done
-      this.extractPageTextIfNeeded(newPage);
-    }
-  }
-
-  /**
-   * Update current section based on page
-   */
-  updateCurrentSection(pageNumber) {
-    const section = this.findSectionForPage(pageNumber);
-    if (section && (!this.currentSection || section.id !== this.currentSection.id)) {
-      const previousSection = this.currentSection;
-      this.currentSection = section;
-      
-      if (this.analyticsTracker) {
-        this.analyticsTracker.currentSection = section;
-        this.analyticsTracker.recordSectionChange(previousSection, section);
-      }
-      
-      // Add activity
-      this.addActivity(`Entered section: ${section.title}`);
-      
-      console.log(`Current section: ${section.title} (Page ${section.page})`);
-    }
-  }
-
-  /**
-   * Find which section a page belongs to
-   */
-  findSectionForPage(pageNumber) {
-    for (const section of this.outlineStructure) {
-      if (this.isPageInSection(pageNumber, section)) {
-        return section;
-      }
+      current = current.parentNode;
     }
     return null;
   }
 
-  /**
-   * Check if a page belongs to a section
-   */
-  isPageInSection(pageNumber, section) {
-    const startPage = section.page;
-    const endPage = section.endPage || this.getNextSectionPage(section) - 1 || this.totalPages;
+  getPageNumberFromElement(pageElement) {
+    if (!pageElement) return this.currentPage;
     
-    return pageNumber >= startPage && pageNumber <= endPage;
-  }
-
-  /**
-   * Get the start page of the next section
-   */
-  getNextSectionPage(currentSection) {
-    const currentIndex = this.outlineStructure.indexOf(currentSection);
-    if (currentIndex >= 0 && currentIndex < this.outlineStructure.length - 1) {
-      return this.outlineStructure[currentIndex + 1].page;
+    // Try different methods to get page number
+    const dataPageNum = pageElement.getAttribute('data-page-number');
+    if (dataPageNum) return parseInt(dataPageNum, 10);
+    
+    const idMatch = pageElement.id && pageElement.id.match(/pageContainer(\d+)/);
+    if (idMatch) return parseInt(idMatch[1], 10);
+    
+    // Look for page number in aria-label
+    const ariaLabel = pageElement.getAttribute('aria-label');
+    if (ariaLabel) {
+      const match = ariaLabel.match(/Page (\d+)/);
+      if (match) return parseInt(match[1], 10);
     }
-    return this.totalPages + 1;
+    
+    return this.currentPage;
   }
 
-  /**
-   * Extract text content for a specific page if not already done
-   */
+  detectSectionFromContent(text, pageNumber) {
+    if (!text || text.length < 2) return null;
+    
+    const cleanText = text.toLowerCase().trim();
+    let bestMatch = null;
+    let highestConfidence = 0;
+    
+    // Get possible sections for this page
+    const possibleSections = this.pageToSectionMap.get(pageNumber) || [];
+    
+    // First, check against section titles
+    for (const patternInfo of this.sectionHeadingPatterns) {
+      const section = patternInfo.section;
+      
+      // Skip if section is not on this page
+      if (pageNumber < section.page || pageNumber > (section.endPage || section.page)) {
+        continue;
+      }
+      
+      let confidence = 0;
+      
+      // Check pattern match
+      if (patternInfo.pattern.test(cleanText)) {
+        confidence = 0.9;
+      } else {
+        // Check word matching
+        const textWords = cleanText.split(/\s+/).filter(w => w.length > 2);
+        const matchingWords = patternInfo.words.filter(w => textWords.includes(w));
+        
+        if (matchingWords.length > 0) {
+          confidence = matchingWords.length / patternInfo.words.length * 0.7;
+        }
+      }
+      
+      // Boost confidence if section is in possible sections
+      if (possibleSections.includes(section)) {
+        confidence *= 1.2;
+      }
+      
+      if (confidence > highestConfidence) {
+        highestConfidence = confidence;
+        bestMatch = section;
+      }
+    }
+    
+    // If no good match, try to detect from page structure
+    if (highestConfidence < 0.3 && this.pageTextContent[pageNumber]) {
+      const pageContent = this.pageTextContent[pageNumber];
+      if (pageContent.structured && pageContent.structured.headings.length > 0) {
+        // Check if selected text matches any heading
+        for (const heading of pageContent.structured.headings) {
+          const similarity = this.calculateTextSimilarity(cleanText, heading.text.toLowerCase());
+          if (similarity > 0.6) {
+            // Find the section for this page
+            const pageSection = possibleSections[0] || this.findSectionForPage(pageNumber);
+            if (pageSection) {
+              return {
+                section: pageSection,
+                confidence: similarity * 0.8
+              };
+            }
+          }
+        }
+      }
+    }
+    
+    return bestMatch ? { section: bestMatch, confidence: highestConfidence } : null;
+  }
+
+  detectSectionFromViewport() {
+    try {
+      // Get visible pages
+      const visiblePages = this.getVisiblePages();
+      if (visiblePages.length === 0) return;
+      
+      // Primary page is the one with most visibility
+      const primaryPage = visiblePages.reduce((a, b) => 
+        a.visibilityRatio > b.visibilityRatio ? a : b
+      );
+      
+      // Get sections for the primary visible page
+      const sections = this.pageToSectionMap.get(primaryPage.number) || [];
+      
+      if (sections.length > 0) {
+        // If page has multiple sections, try to detect from visible content
+        if (sections.length > 1 && this.pageTextContent[primaryPage.number]) {
+          const visibleText = this.getVisibleTextOnPage(primaryPage.element);
+          if (visibleText) {
+            const detected = this.detectSectionFromContent(visibleText, primaryPage.number);
+            if (detected && detected.confidence > 0.5) {
+              this.updateCurrentSection(detected.section, 'viewport_detection');
+              return;
+            }
+          }
+        }
+        
+        // Use the first section for the page
+        this.updateCurrentSection(sections[0], 'page_based');
+      }
+      
+    } catch (error) {
+      console.warn('Error in viewport section detection:', error);
+    }
+  }
+
+  getVisiblePages() {
+    const pages = [];
+    const pageElements = document.querySelectorAll('.page, [data-page-number]');
+    const viewportHeight = window.innerHeight;
+    
+    for (const pageEl of pageElements) {
+      const rect = pageEl.getBoundingClientRect();
+      
+      // Check if page is in viewport
+      if (rect.bottom > 0 && rect.top < viewportHeight) {
+        const visibleHeight = Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0);
+        const visibilityRatio = visibleHeight / rect.height;
+        
+        if (visibilityRatio > 0.1) { // At least 10% visible
+          pages.push({
+            element: pageEl,
+            number: this.getPageNumberFromElement(pageEl),
+            visibilityRatio: visibilityRatio,
+            rect: rect
+          });
+        }
+      }
+    }
+    
+    return pages;
+  }
+
+  getVisibleTextOnPage(pageElement) {
+    if (!pageElement) return '';
+    
+    const textElements = pageElement.querySelectorAll('.textLayer span, .textLayer div');
+    const viewportTop = window.pageYOffset;
+    const viewportBottom = viewportTop + window.innerHeight;
+    
+    let visibleText = '';
+    
+    for (const element of textElements) {
+      const rect = element.getBoundingClientRect();
+      const elementTop = rect.top + viewportTop;
+      const elementBottom = rect.bottom + viewportTop;
+      
+      // Check if element is in viewport
+      if (elementBottom > viewportTop && elementTop < viewportBottom) {
+        visibleText += element.textContent + ' ';
+      }
+    }
+    
+    return visibleText.trim();
+  }
+
+  calculateTextSimilarity(text1, text2) {
+    if (!text1 || !text2) return 0;
+    
+    // Normalize texts
+    const norm1 = text1.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
+    const norm2 = text2.toLowerCase().replace(/[^\w\s]/g, '').split(/\s+/);
+    
+    // Calculate Jaccard similarity
+    const set1 = new Set(norm1);
+    const set2 = new Set(norm2);
+    
+    const intersection = new Set([...set1].filter(x => set2.has(x)));
+    const union = new Set([...set1, ...set2]);
+    
+    return union.size > 0 ? intersection.size / union.size : 0;
+  }
+
+  handlePageChange(newPage) {
+    if (newPage !== this.currentPage) {
+      const oldPage = this.currentPage;
+      console.log(`Page changed: ${oldPage} -> ${newPage}`);
+      
+      // Update current page
+      this.currentPage = newPage;
+      
+      // Record page change in tracker
+      if (this.analyticsTracker) {
+        this.analyticsTracker.recordPageChange(oldPage, newPage);
+      }
+      
+      // Update section based on new page
+      const sections = this.pageToSectionMap.get(newPage) || [];
+      if (sections.length > 0) {
+        // If only one section on page, use it
+        if (sections.length === 1) {
+          this.updateCurrentSection(sections[0], 'page_change');
+        } else {
+          // Multiple sections on page, will detect from content
+          setTimeout(() => this.detectSectionFromViewport(), 100);
+        }
+      }
+      
+      // Add activity
+      this.addActivity(`Moved to page ${newPage}`);
+      
+      // Extract text content for new page if needed
+      this.extractPageTextIfNeeded(newPage);
+    }
+  }
+
+  updateCurrentSection(newSection, detectionMethod = 'unknown') {
+    if (!newSection || (this.currentSection && this.currentSection.id === newSection.id)) {
+      return;
+    }
+    
+    const previousSection = this.currentSection;
+    this.currentSection = newSection;
+    this.lastDetectedSection = newSection;
+    this.sectionDetectionConfidence = detectionMethod === 'text_selection' ? 0.9 : 0.7;
+    
+    if (this.analyticsTracker) {
+      this.analyticsTracker.recordSectionChange(previousSection, newSection);
+    }
+    
+    // Add activity with detection method
+    this.addActivity(`Entered section: ${newSection.title}`);
+    
+    console.log(`Section updated: ${newSection.title} (${detectionMethod})`);
+  }
+
+  findSectionForPage(pageNumber) {
+    const sections = this.pageToSectionMap.get(pageNumber) || [];
+    return sections.length > 0 ? sections[0] : null;
+  }
+
   async extractPageTextIfNeeded(pageNumber) {
     if (!this.options.enableTextExtraction || this.pageTextContent[pageNumber]) {
       return;
@@ -4051,36 +4464,26 @@ class PDFAnalyticsCore {
       const page = await this.pdfDocument.getPage(pageNumber);
       const textContent = await page.getTextContent();
       
-      const text = textContent.items
-        .map(item => item.str)
-        .join(' ')
-        .trim();
+      this.pageTextContent[pageNumber] = {
+        raw: textContent.items.map(item => item.str).join(' ').trim(),
+        items: textContent.items,
+        structured: this.structureTextContent(textContent.items)
+      };
       
-      this.pageTextContent[pageNumber] = text;
-      
-      // Update analytics tracker with new text content
-      if (this.analyticsTracker) {
-        this.analyticsTracker.pageTextContent = text;
-      }
+      console.log(`Extracted text for page ${pageNumber}`);
       
     } catch (error) {
       console.warn(`Error extracting text from page ${pageNumber}:`, error);
     }
   }
 
-  /**
-   * Initialize the analytics tracker component
-   */
   initializeAnalyticsTracker() {
-    // This would initialize your existing PdfAnalyticsTracker component
-    // with the extracted data
     const trackerConfig = {
       currentDocumentId: this.options.documentId,
       currentPage: this.currentPage,
       totalPages: this.totalPages,
       outlineStructure: this.outlineStructure,
       currentSection: this.currentSection,
-      pageTextContent: this.pageTextContent[this.currentPage] || null,
       averageWordsPerPage: this.calculateAverageWordsPerPage()
     };
     
@@ -4089,43 +4492,46 @@ class PDFAnalyticsCore {
     // Initialize the real-time analytics tracker
     this.analyticsTracker = new RealTimeAnalyticsTracker(trackerConfig);
     
-    // Create and show the analytics UI
+    // Create analytics UI
     this.createAnalyticsUI();
     
-    this.trackerConfig = trackerConfig;
+    // Initialize activity log
+    this.activityLog = [];
+    this.addActivity('Session started');
   }
 
-  /**
-   * Calculate average words per page from extracted text
-   */
   calculateAverageWordsPerPage() {
     const textPages = Object.values(this.pageTextContent);
-    if (textPages.length === 0) return 275; // Default fallback
+    if (textPages.length === 0) return 275;
     
-    const totalWords = textPages.reduce((sum, text) => {
-      return sum + text.split(/\s+/).filter(word => word.length > 0).length;
+    const totalWords = textPages.reduce((sum, page) => {
+      const words = page.raw.split(/\s+/).filter(word => word.length > 0);
+      return sum + words.length;
     }, 0);
     
     return Math.round(totalWords / textPages.length);
   }
 
-  /**
-   * Setup auto-save functionality
-   */
   setupAutoSave() {
     setInterval(() => {
-      if (this.analyticsTracker && this.analyticsTracker.saveAnalyticsData) {
-        this.analyticsTracker.saveAnalyticsData();
-      }
+      this.saveAnalyticsData();
     }, 30000); // Save every 30 seconds
   }
 
-  /**
-   * Get current analytics data
-   */
+  saveAnalyticsData() {
+    try {
+      const data = this.getAnalyticsData();
+      const key = `pdf_analytics_${this.options.documentId}`;
+      localStorage.setItem(key, JSON.stringify(data));
+      console.log('Analytics data saved');
+    } catch (error) {
+      console.error('Error saving analytics data:', error);
+    }
+  }
+
   getAnalyticsData() {
-    if (this.analyticsTracker && this.analyticsTracker.calculateAnalytics) {
-      return this.analyticsTracker.calculateAnalytics();
+    if (this.analyticsTracker) {
+      return this.analyticsTracker.getAnalytics();
     }
     
     return {
@@ -4133,16 +4539,29 @@ class PDFAnalyticsCore {
       currentPage: this.currentPage,
       totalPages: this.totalPages,
       sectionsFound: this.outlineStructure.length,
-      isInitialized: this.isInitialized
+      isInitialized: this.isInitialized,
+      timestamp: Date.now()
     };
   }
 
-  /**
-   * Export analytics data
-   */
   exportAnalytics() {
     const data = this.getAnalyticsData();
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const enrichedData = {
+      ...data,
+      documentInfo: {
+        id: this.options.documentId,
+        totalPages: this.totalPages,
+        sections: this.outlineStructure.map(s => ({
+          title: s.title,
+          page: s.page,
+          endPage: s.endPage,
+          completed: data.sections && data.sections[s.id] ? data.sections[s.id].completed : false
+        }))
+      },
+      exportDate: new Date().toISOString()
+    };
+    
+    const blob = new Blob([JSON.stringify(enrichedData, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -4153,50 +4572,13 @@ class PDFAnalyticsCore {
     URL.revokeObjectURL(url);
   }
 
-  /**
-   * Cleanup function
-   */
-  destroy() {
-    console.log('Destroying PDF Analytics...');
-    
-    // Remove analytics UI
-    if (this.analyticsUI) {
-      this.analyticsUI.remove();
-      this.analyticsUI = null;
+  addEventListener(eventName, handler) {
+    if (this.eventBus) {
+      this.eventBus._on(eventName, handler);
+      this.eventListeners.push({ eventName, handler, eventBus: true });
     }
-    
-    // Clear update interval
-    if (this.updateInterval) {
-      clearInterval(this.updateInterval);
-      this.updateInterval = null;
-    }
-    
-    // Remove event listeners
-    this.eventListeners.forEach(({ element, eventName, handler }) => {
-      if (element) {
-        element.removeEventListener(eventName, handler);
-      }
-    });
-    
-    // Cleanup analytics tracker
-    if (this.analyticsTracker && this.analyticsTracker.destroy) {
-      this.analyticsTracker.destroy();
-    }
-    
-    // Clear references
-    this.pdfDocument = null;
-    this.pdfViewer = null;
-    this.eventBus = null;
-    this.analyticsTracker = null;
-    this.eventListeners = [];
-    
-    this.isInitialized = false;
-    console.log('PDF Analytics destroyed');
   }
 
-  /**
-   * Create the real-time analytics UI
-   */
   createAnalyticsUI() {
     // Remove existing UI if any
     if (this.analyticsUI) {
@@ -4237,12 +4619,15 @@ class PDFAnalyticsCore {
           justify-content: space-between;
           align-items: center;
           cursor: pointer;
+          user-select: none;
         }
         
         .analytics-header h3 {
           margin: 0;
           font-size: 14px;
           font-weight: 600;
+          display: flex;
+          align-items: center;
         }
         
         .analytics-header .controls {
@@ -4357,6 +4742,11 @@ class PDFAnalyticsCore {
           font-weight: 600;
         }
         
+        .section-item.in-progress {
+          background: #fff3cd;
+          color: #856404;
+        }
+        
         .section-item.unread {
           background: #f8f9fa;
           color: #6c757d;
@@ -4401,6 +4791,24 @@ class PDFAnalyticsCore {
           font-weight: 600;
         }
         
+        .confidence-indicator {
+          display: inline-block;
+          width: 40px;
+          height: 4px;
+          background: #e9ecef;
+          border-radius: 2px;
+          margin-left: 8px;
+          position: relative;
+          top: -2px;
+        }
+        
+        .confidence-fill {
+          height: 100%;
+          background: #28a745;
+          border-radius: 2px;
+          transition: width 0.3s ease;
+        }
+        
         .scrollbar-thin::-webkit-scrollbar {
           width: 4px;
         }
@@ -4437,11 +4845,11 @@ class PDFAnalyticsCore {
           <div class="section-title">📊 Session Overview</div>
           <div class="stat-grid">
             <div class="stat-item">
-              <span class="stat-value" id="session-time">00:00:00</span>
+              <span class="stat-value time-display" id="session-time">00:00:00</span>
               <div class="stat-label">Session Time</div>
             </div>
             <div class="stat-item">
-              <span class="stat-value" id="active-time">00:00:00</span>
+              <span class="stat-value time-display" id="active-time">00:00:00</span>
               <div class="stat-label">Active Time</div>
             </div>
             <div class="stat-item">
@@ -4477,9 +4885,14 @@ class PDFAnalyticsCore {
         <div class="analytics-section">
           <div class="section-title">📑 Current Section</div>
           <div id="current-section-info" style="padding: 8px; background: #e7f3ff; border-radius: 6px; font-size: 11px;">
-            <strong id="current-section-title">No section detected</strong><br>
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <strong id="current-section-title">No section detected</strong>
+              <div class="confidence-indicator" title="Detection confidence">
+                <div class="confidence-fill" id="confidence-fill" style="width: 0%"></div>
+              </div>
+            </div>
             <span style="color: #6c757d;">
-              Time in section: <span id="section-time">00:00</span>
+              Time in section: <span id="section-time" class="time-display">00:00</span>
             </span>
           </div>
         </div>
@@ -4512,7 +4925,7 @@ class PDFAnalyticsCore {
         <!-- Reading Patterns -->
         <div class="analytics-section">
           <div class="section-title">🔄 Reading Patterns</div>
-          <div style="font-size: 11px; line-height: 1.4;">
+          <div style="font-size: 11px; line-height: 1.6;">
             <div style="display: flex; justify-content: space-between; margin-bottom: 2px;">
               <span>Forward moves:</span>
               <span id="forward-moves">0</span>
@@ -4536,9 +4949,7 @@ class PDFAnalyticsCore {
         <div class="analytics-section">
           <div class="section-title">⚡ Recent Activity</div>
           <div class="activity-feed scrollbar-thin" id="activity-feed">
-            <div class="activity-item">
-              <span class="activity-time">00:00:00</span> - Session started
-            </div>
+            <!-- Activities will be populated here -->
           </div>
         </div>
       </div>
@@ -4552,18 +4963,12 @@ class PDFAnalyticsCore {
     console.log('Analytics UI created');
   }
 
-  /**
-   * Toggle UI minimized state
-   */
   toggleUI() {
     if (this.analyticsUI) {
       this.analyticsUI.classList.toggle('minimized');
     }
   }
 
-  /**
-   * Reset analytics data
-   */
   resetAnalytics() {
     if (confirm('Are you sure you want to reset all analytics data?')) {
       if (this.analyticsTracker) {
@@ -4571,13 +4976,13 @@ class PDFAnalyticsCore {
       }
       this.activityLog = [];
       this.addActivity('Analytics reset');
+      this.currentSection = null;
+      this.lastDetectedSection = null;
+      this.sectionDetectionConfidence = 0;
       console.log('Analytics data reset');
     }
   }
 
-  /**
-   * Start real-time UI updates
-   */
   startRealTimeUpdates() {
     // Update every second
     this.updateInterval = setInterval(() => {
@@ -4588,60 +4993,83 @@ class PDFAnalyticsCore {
     this.updateAnalyticsUI();
   }
 
-  /**
-   * Update the analytics UI with current data
-   */
   updateAnalyticsUI() {
     if (!this.analyticsUI || !this.analyticsTracker) return;
     
-    const analytics = this.analyticsTracker.getAnalytics();
-    
-    // Session Overview
-    document.getElementById('session-time').textContent = this.formatTime(analytics.sessionTime || 0);
-    document.getElementById('active-time').textContent = this.formatTime(analytics.activeTime || 0);
-    document.getElementById('pages-read').textContent = analytics.pagesRead || 0;
-    document.getElementById('reading-speed').textContent = analytics.readingSpeed || 0;
-    
-    // Reading Progress
-    const progressPercent = analytics.progressPercentage || 0;
-    document.getElementById('progress-percentage').textContent = Math.round(progressPercent) + '%';
-    document.getElementById('progress-fill').style.width = progressPercent + '%';
-    document.getElementById('current-page').textContent = this.currentPage;
-    document.getElementById('total-pages').textContent = this.totalPages;
-    document.getElementById('words-read').textContent = (analytics.wordsRead || 0).toLocaleString();
-    
-    // Current Section
-    if (this.currentSection) {
-      document.getElementById('current-section-title').textContent = this.currentSection.title;
-      document.getElementById('section-time').textContent = this.formatTime(analytics.currentSectionTime || 0);
+    try {
+      const analytics = this.analyticsTracker.getAnalytics();
+      
+      // Session Overview
+      this.updateElement('session-time', this.formatTime(analytics.sessionTime || 0));
+      this.updateElement('active-time', this.formatTime(analytics.activeTime || 0));
+      this.updateElement('pages-read', analytics.pagesRead || 0);
+      this.updateElement('reading-speed', analytics.readingSpeed || 0);
+      
+      // Reading Progress
+      const progressPercent = analytics.progressPercentage || 0;
+      this.updateElement('progress-percentage', Math.round(progressPercent) + '%');
+      
+      const progressFill = document.getElementById('progress-fill');
+      if (progressFill) {
+        progressFill.style.width = progressPercent + '%';
+      }
+      
+      this.updateElement('current-page', analytics.currentPage || this.currentPage);
+      this.updateElement('total-pages', analytics.totalPages || this.totalPages);
+      this.updateElement('words-read', (analytics.wordsRead || 0).toLocaleString());
+      
+      // Current Section
+      if (analytics.currentSection) {
+        this.updateElement('current-section-title', analytics.currentSection.title);
+        this.updateElement('section-time', this.formatTime(analytics.currentSectionTime || 0));
+        
+        // Update confidence indicator
+        const confidenceFill = document.getElementById('confidence-fill');
+        if (confidenceFill) {
+          confidenceFill.style.width = (this.sectionDetectionConfidence * 100) + '%';
+        }
+      } else {
+        this.updateElement('current-section-title', 'No section detected');
+        this.updateElement('section-time', '00:00');
+      }
+      
+      // Sections
+      this.updateElement('sections-completed', analytics.sectionsCompleted || 0);
+      this.updateElement('sections-total', this.outlineStructure.length);
+      this.updateSectionsList(analytics.sections || {});
+      
+      // Text Interactions
+      this.updateElement('text-selections', analytics.textSelections || 0);
+      this.updateElement('page-changes', analytics.pageChanges || 0);
+      
+      // Reading Patterns
+      this.updateElement('forward-moves', analytics.forwardMoves || 0);
+      this.updateElement('backward-moves', analytics.backwardMoves || 0);
+      this.updateElement('jump-moves', analytics.jumpMoves || 0);
+      this.updateElement('linear-percentage', Math.round(analytics.linearReadingPercentage || 0) + '%');
+      
+    } catch (error) {
+      console.error('Error updating analytics UI:', error);
     }
-    
-    // Sections
-    document.getElementById('sections-completed').textContent = analytics.sectionsCompleted || 0;
-    document.getElementById('sections-total').textContent = this.outlineStructure.length;
-    this.updateSectionsList(analytics.sections || {});
-    
-    // Text Interactions
-    document.getElementById('text-selections').textContent = analytics.textSelections || 0;
-    document.getElementById('page-changes').textContent = analytics.pageChanges || 0;
-    
-    // Reading Patterns
-    document.getElementById('forward-moves').textContent = analytics.forwardMoves || 0;
-    document.getElementById('backward-moves').textContent = analytics.backwardMoves || 0;
-    document.getElementById('jump-moves').textContent = analytics.jumpMoves || 0;
-    document.getElementById('linear-percentage').textContent = Math.round(analytics.linearReadingPercentage || 0) + '%';
   }
 
-  /**
-   * Update sections list UI
-   */
+  updateElement(id, content) {
+    const element = document.getElementById(id);
+    if (element) {
+      element.textContent = content;
+    }
+  }
+
   updateSectionsList(sectionsData) {
     const sectionsList = document.getElementById('sections-list');
     if (!sectionsList) return;
     
     sectionsList.innerHTML = '';
     
-    this.outlineStructure.forEach(section => {
+    // Flatten sections for display
+    const flatSections = this.flattenOutline(this.outlineStructure);
+    
+    flatSections.forEach(section => {
       const sectionData = sectionsData[section.id] || {};
       const div = document.createElement('div');
       div.className = 'section-item';
@@ -4651,22 +5079,35 @@ class PDFAnalyticsCore {
         div.classList.add('current');
       } else if (sectionData.completed) {
         div.classList.add('completed');
+      } else if (sectionData.timeSpent > 0) {
+        div.classList.add('in-progress');
       } else {
         div.classList.add('unread');
       }
       
+      const timeSpent = sectionData.timeSpent || 0;
+      const visits = sectionData.visits || 0;
+      
       div.innerHTML = `
-        <span>${section.title}</span>
-        <span style="font-size: 10px;">${this.formatTime(sectionData.timeSpent || 0)}</span>
+        <div style="flex: 1; overflow: hidden;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: ${div.classList.contains('current') ? '600' : '400'}; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">
+              ${section.level > 1 ? '&nbsp;&nbsp;'.repeat(section.level - 1) + '└ ' : ''}${section.title}
+              ${div.classList.contains('current') ? ' ◉' : ''}
+              ${sectionData.completed ? ' ✓' : ''}
+            </span>
+            <div style="text-align: right; font-size: 10px; flex-shrink: 0; margin-left: 8px;">
+              <div>${this.formatTime(timeSpent, true)}</div>
+              ${visits > 0 ? `<div style="color: #6c757d;">${visits}x</div>` : ''}
+            </div>
+          </div>
+        </div>
       `;
       
       sectionsList.appendChild(div);
     });
   }
 
-  /**
-   * Add activity to the feed
-   */
   addActivity(message) {
     if (!this.activityLog) {
       this.activityLog = [];
@@ -4689,9 +5130,6 @@ class PDFAnalyticsCore {
     this.updateActivityFeed();
   }
 
-  /**
-   * Update activity feed UI
-   */
   updateActivityFeed() {
     const activityFeed = document.getElementById('activity-feed');
     if (!activityFeed || !this.activityLog) return;
@@ -4706,23 +5144,90 @@ class PDFAnalyticsCore {
       `;
       activityFeed.appendChild(div);
     });
+    
+    // If no activities, show placeholder
+    if (this.activityLog.length === 0) {
+      activityFeed.innerHTML = '<div class="activity-item">No recent activity</div>';
+    }
   }
 
-  /**
-   * Format time in HH:MM:SS format
-   */
-  formatTime(milliseconds) {
-    if (!milliseconds || milliseconds < 0) return "00:00:00";
+  formatTime(milliseconds, compact = false) {
+    if (!milliseconds || milliseconds < 0) return compact ? "0m" : "00:00:00";
     
     const seconds = Math.floor(milliseconds / 1000);
     const minutes = Math.floor(seconds / 60);
     const hours = Math.floor(minutes / 60);
     
-    const h = hours.toString().padStart(2, '0');
-    const m = (minutes % 60).toString().padStart(2, '0');
-    const s = (seconds % 60).toString().padStart(2, '0');
+    if (compact) {
+      if (hours > 0) {
+        return `${hours}h ${minutes % 60}m`;
+      } else if (minutes > 0) {
+        return `${minutes}m`;
+      } else {
+        return `${seconds}s`;
+      }
+    } else {
+      if (hours > 0) {
+        const h = hours.toString().padStart(2, '0');
+        const m = (minutes % 60).toString().padStart(2, '0');
+        const s = (seconds % 60).toString().padStart(2, '0');
+        return `${h}:${m}:${s}`;
+      } else {
+        const m = minutes.toString().padStart(2, '0');
+        const s = (seconds % 60).toString().padStart(2, '0');
+        return `${m}:${s}`;
+      }
+    }
+  }
+
+  destroy() {
+    console.log('Destroying PDF Analytics...');
     
-    return `${h}:${m}:${s}`;
+    // Clear timeouts
+    if (this.sectionSwitchTimeout) {
+      clearTimeout(this.sectionSwitchTimeout);
+    }
+    
+    // Remove analytics UI
+    if (this.analyticsUI) {
+      this.analyticsUI.remove();
+      this.analyticsUI = null;
+    }
+    
+    // Clear update interval
+    if (this.updateInterval) {
+      clearInterval(this.updateInterval);
+      this.updateInterval = null;
+    }
+    
+    // Remove event listeners
+    this.eventListeners.forEach(({ element, eventName, handler, eventBus }) => {
+      if (eventBus && this.eventBus) {
+        this.eventBus._off(eventName, handler);
+      } else if (element) {
+        element.removeEventListener(eventName, handler);
+      }
+    });
+    
+    // Cleanup analytics tracker
+    if (this.analyticsTracker) {
+      this.analyticsTracker.destroy();
+    }
+    
+    // Clear caches
+    this.sectionDetectionCache.clear();
+    this.pageToSectionMap.clear();
+    
+    // Clear references
+    this.pdfDocument = null;
+    this.pdfViewer = null;
+    this.eventBus = null;
+    this.analyticsTracker = null;
+    this.eventListeners = [];
+    this.pageTextContent = {};
+    
+    this.isInitialized = false;
+    console.log('PDF Analytics destroyed');
   }
 }
 
@@ -4765,7 +5270,8 @@ if (document.readyState === 'loading') {
         console.log('Auto-initializing PDF Analytics...');
         window.initializePDFAnalytics({
           documentId: 'auto-detected',
-          enableTextExtraction: true
+          enableTextExtraction: true,
+          sectionDetectionMode: 'hybrid'
         });
       }
     }, 1000);
@@ -4776,10 +5282,11 @@ if (document.readyState === 'loading') {
       console.log('Auto-initializing PDF Analytics...');
       window.initializePDFAnalytics({
         documentId: 'auto-detected',
-        enableTextExtraction: true
+        enableTextExtraction: true,
+        sectionDetectionMode: 'hybrid'
       });
     }
   }, 1000);
 }
 
-console.log('PDF Analytics Core loaded. Use initializePDFAnalytics() to start tracking.');
+console.log('PDF Analytics Core loaded. Use window.initializePDFAnalytics() to start tracking.');
