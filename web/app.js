@@ -4518,6 +4518,395 @@ class PDFAnalyticsCore {
     }, 30000); // Save every 30 seconds
   }
 
+
+  // Add to setupEventListeners method in PDFAnalyticsCore class
+setupEventListeners() {
+  console.log('Setting up event listeners...');
+  // Page change events
+  this.addEventListener('pagechanging', (evt) => {
+    this.handlePageChange(evt.pageNumber);
+  });
+  // Document events
+  this.addEventListener('documentloaded', () => {
+    console.log('Document fully loaded');
+  });
+  // Text selection tracking
+  this.setupTextSelectionTracking();
+  // Viewport tracking for better section detection
+  this.setupViewportTracking();
+  // Add hover detection for better section identification
+  this.setupHoverDetection();
+  console.log('Event listeners configured');
+}
+
+// Add this new method to PDFAnalyticsCore class
+setupHoverDetection() {
+  let hoverThrottle;
+  const handleHover = (event) => {
+    // Skip if too frequent
+    if (hoverThrottle) return;
+    
+    hoverThrottle = setTimeout(() => {
+      hoverThrottle = null;
+      
+      // Find text element being hovered
+      const target = event.target;
+      if (!target || !target.textContent || target.textContent.trim().length < 3) return;
+      
+      // Get page element
+      const pageElement = this.findPageElement(target);
+      if (!pageElement) return;
+      
+      // Get page number
+      const pageNumber = this.getPageNumberFromElement(pageElement);
+      if (!pageNumber) return;
+      
+      // Extract text from the hovered element and surrounding elements
+      const hoverContext = this.getHoverContextText(target, pageElement);
+      if (!hoverContext) return;
+      
+      // Try to detect section from hover context
+      const detectedSection = this.detectSectionFromContent(hoverContext, pageNumber);
+      if (detectedSection && detectedSection.confidence > 0.4) {
+        this.updateCurrentSection(detectedSection.section, 'hover_detection');
+      } else {
+        // If no good match, extract more text around the hover area
+        this.extractSectionFromHoverPosition(target, pageNumber);
+      }
+    }, 300); // Throttle hover events
+  };
+  
+  // Add event listener to document
+  document.addEventListener('mousemove', handleHover, { passive: true });
+  this.eventListeners.push({
+    element: document,
+    eventName: 'mousemove',
+    handler: handleHover
+  });
+  
+  console.log('Hover detection set up');
+}
+
+// Add helper methods for hover detection
+getHoverContextText(element, pageElement) {
+  // Get the text from the hovered element
+  let hoverText = element.textContent.trim();
+  
+  // If text is too short, get siblings text as well
+  if (hoverText.length < 20) {
+    // Get parent and siblings
+    const parent = element.parentNode;
+    if (parent) {
+      const siblings = Array.from(parent.childNodes);
+      // Combine text from siblings
+      hoverText = siblings
+        .filter(node => node.nodeType === Node.TEXT_NODE || node.nodeType === Node.ELEMENT_NODE)
+        .map(node => node.textContent || '')
+        .join(' ')
+        .trim();
+    }
+  }
+  
+  // If still too short, get surrounding text
+  if (hoverText.length < 30) {
+    // Get nearby text elements
+    const textElements = pageElement.querySelectorAll('.textLayer span, .textLayer div');
+    if (textElements.length > 0) {
+      // Find position of current element
+      const elementRect = element.getBoundingClientRect();
+      const nearbyElements = Array.from(textElements)
+        .filter(el => {
+          const rect = el.getBoundingClientRect();
+          // Elements within reasonable proximity
+          return Math.abs(rect.top - elementRect.top) < 50;
+        })
+        .slice(0, 5); // Limit to 5 nearby elements
+      
+      if (nearbyElements.length > 0) {
+        hoverText = nearbyElements
+          .map(el => el.textContent || '')
+          .join(' ')
+          .trim();
+      }
+    }
+  }
+  
+  return hoverText;
+}
+
+extractSectionFromHoverPosition(element, pageNumber) {
+  // Already have text content for this page
+  if (this.pageTextContent[pageNumber]) {
+    const textContent = this.pageTextContent[pageNumber];
+    
+    // Get position of hovered element
+    const elementRect = element.getBoundingClientRect();
+    const elementY = elementRect.top;
+    
+    // Find headings above the hover position
+    if (textContent.structured && textContent.structured.headings.length > 0) {
+      // Sort headings by position (top to bottom)
+      const sortedHeadings = [...textContent.structured.headings]
+        .sort((a, b) => a.y - b.y);
+      
+      // Find last heading before hover position
+      let closestHeading = null;
+      let minDistance = Infinity;
+      
+      for (const heading of sortedHeadings) {
+        const headingElement = document.evaluate(
+          `//*[contains(text(), "${heading.text.substring(0, 20)}")]`,
+          document,
+          null,
+          XPathResult.FIRST_ORDERED_NODE_TYPE,
+          null
+        ).singleNodeValue;
+        
+        if (headingElement) {
+          const headingRect = headingElement.getBoundingClientRect();
+          const distance = Math.abs(elementY - headingRect.top);
+          
+          // Only consider headings above or very close to hover position
+          if (headingRect.top <= elementY + 30 && distance < minDistance) {
+            minDistance = distance;
+            closestHeading = heading;
+          }
+        }
+      }
+      
+      if (closestHeading) {
+        // Find or create section for this heading
+        const sections = this.pageToSectionMap.get(pageNumber) || [];
+        let matchedSection = null;
+        
+        // Try to match with existing sections
+        for (const section of sections) {
+          const similarity = this.calculateTextSimilarity(
+            closestHeading.text.toLowerCase(),
+            section.title.toLowerCase()
+          );
+          
+          if (similarity > 0.6) {
+            matchedSection = section;
+            break;
+          }
+        }
+        
+        // If matched section found, update current section
+        if (matchedSection) {
+          this.updateCurrentSection(matchedSection, 'heading_match');
+          return;
+        }
+        
+        // If no match but we're confident this is a heading, create a dynamic section
+        if (closestHeading.height > 14 || closestHeading.text.length < 60) {
+          // Check if we already have a dynamic section for this heading
+          const dynamicSectionId = `dynamic_section_${pageNumber}_${closestHeading.text.substring(0, 20).replace(/[^a-z0-9]/gi, '_').toLowerCase()}`;
+          
+          // Find in outline structure or create new
+          let dynamicSection = this.outlineStructure.find(s => s.id === dynamicSectionId);
+          
+          if (!dynamicSection) {
+            dynamicSection = {
+              id: dynamicSectionId,
+              title: closestHeading.text,
+              page: pageNumber,
+              endPage: pageNumber,
+              level: 2,
+              isDynamic: true
+            };
+            
+            // Add to outline structure
+            this.outlineStructure.push(dynamicSection);
+            
+            // Update section mapping
+            if (!this.pageToSectionMap.has(pageNumber)) {
+              this.pageToSectionMap.set(pageNumber, []);
+            }
+            this.pageToSectionMap.get(pageNumber).push(dynamicSection);
+            
+            // Initialize in analytics tracker
+            if (this.analyticsTracker) {
+              this.analyticsTracker.sectionData[dynamicSection.id] = {
+                id: dynamicSection.id,
+                title: dynamicSection.title,
+                page: dynamicSection.page,
+                endPage: dynamicSection.endPage,
+                timeSpent: 0,
+                visits: 0,
+                completed: false,
+                wordsRead: 0,
+                startTime: null,
+                endTime: null,
+                pagesInSection: [pageNumber]
+              };
+            }
+            
+            console.log(`Created dynamic section: ${dynamicSection.title}`);
+          }
+          
+          this.updateCurrentSection(dynamicSection, 'dynamic_detection');
+        }
+      }
+    }
+  } else {
+    // We don't have text content yet, extract it
+    this.extractPageTextIfNeeded(pageNumber).then(() => {
+      // Try detection again after extraction
+      setTimeout(() => {
+        this.extractSectionFromHoverPosition(element, pageNumber);
+      }, 100);
+    });
+  }
+}
+
+// Improve detectSectionFromViewport method
+detectSectionFromViewport() {
+  try {
+    // Get visible pages
+    const visiblePages = this.getVisiblePages();
+    if (visiblePages.length === 0) return;
+    
+    // Primary page is the one with most visibility
+    const primaryPage = visiblePages.reduce((a, b) =>
+      a.visibilityRatio > b.visibilityRatio ? a : b
+    );
+    
+    // Get sections for the primary visible page
+    const sections = this.pageToSectionMap.get(primaryPage.number) || [];
+    
+    if (sections.length > 0) {
+      // If page has multiple sections, try to detect from visible content
+      if (sections.length > 1) {
+        const visibleText = this.getVisibleTextOnPage(primaryPage.element);
+        if (visibleText) {
+          // Extract all visible headings
+          const visibleHeadings = this.extractHeadingsFromVisibleArea(primaryPage.element);
+          
+          if (visibleHeadings.length > 0) {
+            // Sort headings by position (top to bottom)
+            visibleHeadings.sort((a, b) => a.top - b.top);
+            
+            // Find the first visible heading
+            const topHeading = visibleHeadings[0];
+            
+            // Find matching section
+            for (const section of sections) {
+              const similarity = this.calculateTextSimilarity(
+                topHeading.text.toLowerCase(),
+                section.title.toLowerCase()
+              );
+              
+              if (similarity > 0.6) {
+                this.updateCurrentSection(section, 'visible_heading');
+                return;
+              }
+            }
+          }
+          
+          // If no heading match, try content match
+          const detected = this.detectSectionFromContent(visibleText, primaryPage.number);
+          if (detected && detected.confidence > 0.5) {
+            this.updateCurrentSection(detected.section, 'viewport_detection');
+            return;
+          }
+        }
+      }
+      
+      // Use the first section for the page if no better detection
+      this.updateCurrentSection(sections[0], 'page_based');
+    }
+  } catch (error) {
+    console.warn('Error in viewport section detection:', error);
+  }
+}
+
+// Add helper method to extract headings from visible area
+extractHeadingsFromVisibleArea(pageElement) {
+  const headings = [];
+  const viewportTop = 0;
+  const viewportBottom = window.innerHeight;
+  
+  // Find all text elements
+  const textElements = pageElement.querySelectorAll('.textLayer span, .textLayer div');
+  
+  for (const element of textElements) {
+    // Skip empty elements
+    if (!element.textContent || element.textContent.trim().length < 3) continue;
+    
+    const rect = element.getBoundingClientRect();
+    
+    // Check if element is in viewport
+    if (rect.bottom > viewportTop && rect.top < viewportBottom) {
+      // Check if it might be a heading (larger font, bold, etc.)
+      const style = window.getComputedStyle(element);
+      const fontSize = parseFloat(style.fontSize);
+      const fontWeight = style.fontWeight;
+      
+      const isLargeFont = fontSize > 14;
+      const isBold = parseInt(fontWeight, 10) >= 600;
+      const isShortText = element.textContent.trim().length < 80;
+      
+      // Scoring system for headings
+      let headingScore = 0;
+      if (isLargeFont) headingScore += 2;
+      if (isBold) headingScore += 1;
+      if (isShortText) headingScore += 1;
+      
+      // If likely a heading, add to list
+      if (headingScore >= 2) {
+        headings.push({
+          text: element.textContent.trim(),
+          element: element,
+          top: rect.top,
+          fontSize: fontSize,
+          score: headingScore
+        });
+      }
+    }
+  }
+  
+  return headings;
+}
+
+// Improve the getPageNumberFromElement method for better accuracy
+getPageNumberFromElement(pageElement) {
+  if (!pageElement) return this.currentPage;
+  
+  // Try different methods to get page number
+  // 1. Direct data attribute
+  const dataPageNum = pageElement.getAttribute('data-page-number');
+  if (dataPageNum) return parseInt(dataPageNum, 10);
+  
+  // 2. ID-based extraction
+  const idMatch = pageElement.id && pageElement.id.match(/pageContainer(\d+)/);
+  if (idMatch) return parseInt(idMatch[1], 10);
+  
+  // 3. Page number from aria-label
+  const ariaLabel = pageElement.getAttribute('aria-label');
+  if (ariaLabel) {
+    const match = ariaLabel.match(/Page (\d+)/);
+    if (match) return parseInt(match[1], 10);
+  }
+  
+  // 4. Look for page number in any child elements
+  const pageNumberElements = pageElement.querySelectorAll('.pageNumber, .page-number');
+  for (const element of pageNumberElements) {
+    const text = element.textContent.trim();
+    const match = text.match(/(\d+)/);
+    if (match) return parseInt(match[1], 10);
+  }
+  
+  // 5. Check if the element itself has a page number as text
+  const elementText = pageElement.textContent;
+  if (elementText) {
+    const match = elementText.match(/Page (\d+)/i);
+    if (match) return parseInt(match[1], 10);
+  }
+  
+  return this.currentPage;
+}
+
   saveAnalyticsData() {
     try {
       const data = this.getAnalyticsData();
